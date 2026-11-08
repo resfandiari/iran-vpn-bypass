@@ -5,10 +5,11 @@ cd "$(dirname "$0")"
 
 APP="dist/IranBypass.app"
 rm -rf dist
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 swiftc -O -o "$APP/Contents/MacOS/IranBypass" main.swift
 cp Info.plist "$APP/Contents/Info.plist"
+cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 
 echo "Built $APP"

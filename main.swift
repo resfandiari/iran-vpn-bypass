@@ -816,10 +816,11 @@ struct IranBypassApp: App {
     @StateObject private var vm = BypassViewModel()
 
     var body: some Scene {
-        MenuBarExtra {
+        // HIG for menu bar icons: template rendering, ~16–18 pt, matching the
+        // system's own status items. The systemImage initializer lets macOS size
+        // and render the SF Symbol exactly like its built-in status icons.
+        MenuBarExtra("Iran VPN Bypass", systemImage: vm.enabled ? "shield.lefthalf.filled" : "shield") {
             ContentView(vm: vm)
-        } label: {
-            Image(systemName: vm.enabled ? "shield.lefthalf.filled" : "shield")
         }
         .menuBarExtraStyle(.window)
     }

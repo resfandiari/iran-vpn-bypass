@@ -61,11 +61,11 @@ domains resolve to Iranian IPs, which are then routed directly.)
 
 ```bash
 ./build.sh
-open dist/IranBypass.app
+cp -R dist/IranBypass.app /Applications/   # optional — keeps it with your other apps
+open /Applications/IranBypass.app          # or: open dist/IranBypass.app
 ```
 
-- Drag `dist/IranBypass.app` to `/Applications` (optional) and add it to
-  **System Settings → General → Login Items** so it restores the bypass after reboot.
+- Add it to **System Settings → General → Login Items** so it restores the bypass after reboot.
 - Click the shield icon in the menu bar and flip the switch:
   - **On (first time only)**: macOS asks for your admin password **once** to install a tiny
     password-free helper — `/usr/local/libexec/iranbypass-helper` plus `/etc/sudoers.d/iranbypass`
