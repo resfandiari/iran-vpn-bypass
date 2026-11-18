@@ -14,6 +14,7 @@ import SwiftUI
 import AppKit
 import Network
 import SystemConfiguration
+import Darwin
 
 // MARK: - Errors
 
@@ -209,6 +210,72 @@ enum Proto {
         }
         return (code, pairs.map { CIDR(network: $0.0, prefix: $0.1) })
     }
+
+    // MARK: geosite.dat (GeoIPList-style, but for domains)
+    //
+    //   GeoSiteList { repeated GeoSite entry = 1; }
+    //   GeoSite { string country_code = 1; repeated Domain domain = 2; }
+    //   Domain { Type type = 1; string value = 2; }   // 0 plain, 1 regex, 2 domain, 3 full
+
+    /// Parse a geosite.dat (GeoSiteList) into country code → resolvable hostnames.
+    /// Regex entries are skipped; only `domain` (suffix) and `full` entries are real
+    /// hostnames we can hand to the resolver.
+    static func parseGeoSiteList(_ data: Data) throws -> [String: [String]] {
+        var c = Cursor([UInt8](data))
+        var result: [String: [String]] = [:]
+        while c.i < c.buf.count {
+            let tag = try c.varint()
+            let field = tag >> 3, wt = tag & 7
+            if field == 1, wt == 2 {
+                let len = Int(try c.varint())
+                let entry = try c.take(len)
+                if let (code, domains) = try parseGeoSiteEntry(Array(entry)) {
+                    result[code, default: []].append(contentsOf: domains)
+                }
+            } else {
+                try c.skip(wt)
+            }
+        }
+        return result
+    }
+
+    private static func parseGeoSiteEntry(_ bytes: [UInt8]) throws -> (String, [String])? {
+        var c = Cursor(bytes)
+        var code = ""
+        var domains: [String] = []
+        while c.i < c.buf.count {
+            let tag = try c.varint()
+            let field = tag >> 3, wt = tag & 7
+            switch (field, wt) {
+            case (1, 2):
+                let raw = try c.take(Int(try c.varint()))
+                code = String(bytes: raw, encoding: .utf8) ?? ""
+            case (2, 2):
+                var sub = Cursor(Array(try c.take(Int(try c.varint()))))
+                var type: UInt64 = 0
+                var value = ""
+                while sub.i < sub.buf.count {
+                    let t2 = try sub.varint()
+                    let f2 = t2 >> 3, w2 = t2 & 7
+                    if f2 == 1, w2 == 0 {
+                        type = try sub.varint()
+                    } else if f2 == 2, w2 == 2 {
+                        let raw = try sub.take(Int(try sub.varint()))
+                        value = String(bytes: raw, encoding: .utf8) ?? ""
+                    } else {
+                        try sub.skip(w2)
+                    }
+                }
+                // 0 = plain (substring, not a hostname), 1 = regex, 2 = domain, 3 = full
+                if (type == 2 || type == 3), !value.isEmpty {
+                    domains.append(value.lowercased())
+                }
+            default:
+                try c.skip(wt)
+            }
+        }
+        return (code, domains)
+    }
 }
 
 // MARK: - Process helper
@@ -232,6 +299,25 @@ func runSync(_ path: String, _ args: [String]) throws -> (out: String, err: Stri
     let out = String(data: outData, encoding: .utf8) ?? ""
     let err = String(data: errData, encoding: .utf8) ?? ""
     return (out, err, p.terminationStatus)
+}
+
+/// Blocking download of a URL (used from background tasks only).
+func downloadSync(_ url: URL, resourceTimeout: TimeInterval = 300) throws -> Data {
+    let cfg = URLSessionConfiguration.ephemeral
+    cfg.timeoutIntervalForRequest = 60
+    cfg.timeoutIntervalForResource = resourceTimeout
+    let session = URLSession(configuration: cfg)
+    defer { session.finishTasksAndInvalidate() }
+    let sem = DispatchSemaphore(value: 0)
+    var result: Result<Data, Error>!
+    session.dataTask(with: url) { d, r, e in
+        if let e = e { result = .failure(e) }
+        else if let d = d, let h = r as? HTTPURLResponse, (200..<300).contains(h.statusCode) { result = .success(d) }
+        else { result = .failure(BypassError.badHTTP((r as? HTTPURLResponse)?.statusCode ?? -1)) }
+        sem.signal()
+    }.resume()
+    sem.wait()
+    return try result.get()
 }
 
 // MARK: - Iranian IP list (chocolate4u/Iran-v2ray-rules)
@@ -272,21 +358,7 @@ final class IPListStore {
     }
 
     func downloadGeoIPSync() throws -> Data {
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 60
-        cfg.timeoutIntervalForResource = 300
-        let session = URLSession(configuration: cfg)
-        defer { session.finishTasksAndInvalidate() }
-        let sem = DispatchSemaphore(value: 0)
-        var result: Result<Data, Error>!
-        session.dataTask(with: Self.geoipURL) { d, r, e in
-            if let e = e { result = .failure(e) }
-            else if let d = d, let h = r as? HTTPURLResponse, (200..<300).contains(h.statusCode) { result = .success(d) }
-            else { result = .failure(BypassError.badHTTP((r as? HTTPURLResponse)?.statusCode ?? -1)) }
-            sem.signal()
-        }.resume()
-        sem.wait()
-        return try result.get()
+        try downloadSync(Self.geoipURL)
     }
 
     func updateSync(force: Bool) throws -> [CIDR] {
@@ -308,23 +380,318 @@ final class IPListStore {
     }
 }
 
+// MARK: - DNS resolution (domains → IPv4)
+
+enum DNS {
+    /// Resolve a hostname to its IPv4 addresses, skipping non-routable results.
+    static func resolveIPv4(_ host: String) -> [UInt32] {
+        var hints = addrinfo(ai_flags: 0, ai_family: AF_INET, ai_socktype: SOCK_STREAM,
+                             ai_protocol: 0, ai_addrlen: 0, ai_canonname: nil,
+                             ai_addr: nil, ai_next: nil)
+        var res: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &res) == 0, let head = res else { return [] }
+        defer { freeaddrinfo(head) }
+        var out = Set<UInt32>()
+        var p: UnsafeMutablePointer<addrinfo>? = head
+        while let cur = p {
+            if let sa = cur.pointee.ai_addr, sa.pointee.sa_family == sa_family_t(AF_INET) {
+                sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
+                    let v = UInt32(bigEndian: sin.pointee.sin_addr.s_addr)
+                    if isRoutable(v) { out.insert(v) }
+                }
+            }
+            p = cur.pointee.ai_next
+        }
+        return Array(out)
+    }
+
+    /// Exclude loopback, link-local, private, CGNAT, multicast and reserved space.
+    static func isRoutable(_ ip: UInt32) -> Bool {
+        let b0 = (ip >> 24) & 255, b1 = (ip >> 16) & 255, b2 = (ip >> 8) & 255
+        if b0 == 0 || b0 == 127 || b0 >= 224 { return false }        // 0/8, 127/8, 224/4, 240/4
+        if b0 == 10 { return false }                                  // 10/8
+        if b0 == 172, (16...31).contains(b1) { return false }         // 172.16/12
+        if b0 == 192, b1 == 168 { return false }                      // 192.168/16
+        if b0 == 169, b1 == 254 { return false }                      // 169.254/16
+        if b0 == 100, (64...127).contains(b1) { return false }        // 100.64/10
+        if b0 == 192, b1 == 0, b2 == 0 { return false }               // 192.0.0/24
+        if b0 == 198, b1 == 18 || b1 == 19 { return false }           // 198.18/15
+        return true
+    }
+
+    /// Resolve many hostnames concurrently (bounded in-flight, overall deadline).
+    static func resolveAll(_ hosts: [String], concurrency: Int = 48, deadline: TimeInterval = 600,
+                           progress: ((Int, Int) -> Void)? = nil) -> [String: [UInt32]] {
+        let total = hosts.count
+        let lock = NSLock()
+        var out: [String: [UInt32]] = [:]
+        var done = 0
+        let start = Date()
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = concurrency
+        queue.qualityOfService = .utility
+        // Keep exactly `concurrency` lookups in flight. The producer blocks on the
+        // semaphore, so the overall deadline is enforced without queueing the whole
+        // list up front (and without per-chunk drain stalls).
+        let slots = DispatchSemaphore(value: concurrency)
+        for host in hosts {
+            if Date().timeIntervalSince(start) > deadline { break }
+            slots.wait()
+            queue.addOperation {
+                let ips = resolveIPv4(host)
+                lock.lock()
+                out[host] = ips
+                done += 1
+                let n = done
+                lock.unlock()
+                progress?(n, total)
+                slots.signal()
+            }
+        }
+        queue.waitUntilAllOperationsAreFinished()
+        return out
+    }
+}
+
+// MARK: - Iranian website list (geosite.dat, category "ir") + resolution cache
+
+final class DomainListStore {
+    static let geositeURL = URL(string: "https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat")!
+    static let maxAge: TimeInterval = 7 * 24 * 3600
+
+    let dir: URL
+    let domainsURL: URL        // downloaded Iranian domains
+    let customURL: URL         // user-added domains
+    let resolvedURL: URL       // IPv4 /32 routes resolved from the downloaded list
+    let customResolvedURL: URL // IPv4 /32 routes resolved from the custom list
+    let stampURL: URL
+
+    init() {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        dir = base.appendingPathComponent("IranBypass", isDirectory: true)
+        domainsURL = dir.appendingPathComponent("iran-domains.txt")
+        customURL = dir.appendingPathComponent("custom-domains.txt")
+        resolvedURL = dir.appendingPathComponent("website-ipv4.txt")
+        customResolvedURL = dir.appendingPathComponent("custom-website-ipv4.txt")
+        stampURL = dir.appendingPathComponent("domains-date.txt")
+    }
+
+    private func readList(_ url: URL) -> [String] {
+        guard let s = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+        return s.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+
+    private func write(_ lines: [String], to url: URL) throws {
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    func loadDomains() -> [String] { readList(domainsURL) }
+    func loadCustom() -> [String] { readList(customURL) }
+
+    /// All cached website routes: downloaded list + custom domains.
+    func loadResolved() -> [CIDR] {
+        (readList(resolvedURL) + readList(customResolvedURL)).compactMap { CIDR(string: $0) }
+    }
+
+    func cachedDate() -> Date? {
+        if let s = try? String(contentsOf: stampURL, encoding: .utf8),
+           let t = TimeInterval(s.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return Date(timeIntervalSince1970: t)
+        }
+        return (try? FileManager.default.attributesOfItem(atPath: resolvedURL.path))?[.modificationDate] as? Date
+    }
+
+    func isFresh() -> Bool {
+        guard let d = cachedDate() else { return false }
+        return Date().timeIntervalSince(d) < Self.maxAge
+    }
+
+    func hasResolved() -> Bool { !loadResolved().isEmpty }
+
+    // MARK: custom domains
+
+    /// Accept "example.com", "https://example.com/path", "*.example.com", …
+    static func normalizeDomain(_ raw: String) -> String? {
+        var d = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let i = d.range(of: "://") { d = String(d[i.upperBound...]) }
+        if let i = d.firstIndex(where: { $0 == "/" || $0 == "?" || $0 == "#" }) { d = String(d[..<i]) }
+        if let at = d.firstIndex(of: "@") { d = String(d[d.index(after: at)...]) }
+        if d.hasPrefix("*.") { d.removeFirst(2) }
+        if let colon = d.firstIndex(of: ":"), !d.contains("]") { d = String(d[..<colon]) }
+        if d.hasSuffix(".") { d.removeLast() }
+        guard d.contains("."),
+              d.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" || $0 == "_" }) else { return nil }
+        return d
+    }
+
+    func addCustom(_ raw: String) throws -> String {
+        guard let d = Self.normalizeDomain(raw) else {
+            throw BypassError.runtime("“\(raw)” doesn’t look like a domain")
+        }
+        var list = loadCustom()
+        if !list.contains(d) {
+            list.append(d)
+            list.sort()
+            try write(list, to: customURL)
+        }
+        return d
+    }
+
+    func removeCustom(_ d: String) throws {
+        var list = loadCustom()
+        list.removeAll { $0 == d }
+        try write(list, to: customURL)
+    }
+
+    // MARK: download + resolve
+
+    @discardableResult
+    func downloadDomainsSync() throws -> [String] {
+        let data = try downloadSync(Self.geositeURL, resourceTimeout: 300)
+        let all = try Proto.parseGeoSiteList(data)
+        // "category-ir" is the same list with inactive domains removed (checked daily).
+        var domains = all["category-ir"] ?? all["CATEGORY-IR"] ?? all["ir"] ?? all["IR"] ?? []
+        domains = domains.filter { $0.contains(".") }
+        guard !domains.isEmpty else { throw BypassError.runtime("Website list came back empty — try again later") }
+        domains = Array(Set(domains)).sorted()
+        try write(domains, to: domainsURL)
+        try "\(Int(Date().timeIntervalSince1970))".write(to: stampURL, atomically: true, encoding: .utf8)
+        return domains
+    }
+
+    /// Binary search for `ip` inside a sorted, non-overlapping CIDR list.
+    static func contains(_ ranges: [CIDR], _ ip: UInt32) -> Bool {
+        var lo = 0, hi = ranges.count - 1, best = -1
+        while lo <= hi {
+            let mid = (lo + hi) / 2
+            if ranges[mid].network <= ip { best = mid; lo = mid + 1 } else { hi = mid - 1 }
+        }
+        return best >= 0 && ranges[best].broadcast >= ip
+    }
+
+    private func resolveHosts(_ hosts: [String], exclude: [CIDR], progress: ((Int, Int) -> Void)?) -> [CIDR] {
+        guard !hosts.isEmpty else { return [] }
+        let throttled: ((Int, Int) -> Void)? = progress.map { report in
+            { done, total in if done % 25 == 0 || done == total { report(done, total) } }
+        }
+        let map = DNS.resolveAll(hosts, progress: throttled)
+        let sorted = exclude.sorted()
+        var cidrs: [CIDR] = []
+        for (_, ips) in map {
+            for ip in ips {
+                // Already reached directly through the Iranian IP ranges — skip.
+                if !sorted.isEmpty, Self.contains(sorted, ip) { continue }
+                cidrs.append(CIDR(network: ip, prefix: 32))
+            }
+        }
+        return aggregate(cidrs)
+    }
+
+    /// Re-resolve the downloaded Iranian domains into cached /32 routes.
+    @discardableResult
+    func resolveDomainsSync(exclude: [CIDR] = [], progress: ((Int, Int) -> Void)? = nil) throws -> [CIDR] {
+        let hosts = loadDomains()
+        guard !hosts.isEmpty else { throw BypassError.runtime("Website list is empty — update it first") }
+        let agg = resolveHosts(hosts, exclude: exclude, progress: progress)
+        guard !agg.isEmpty else { throw BypassError.runtime("No website IPs resolved (check your connection)") }
+        try write(agg.map(\.description), to: resolvedURL)
+        return agg
+    }
+
+    /// Re-resolve only the user's custom domains (fast). Custom domains are kept
+    /// even when their IP is inside an Iranian range, so they always show as bypassed.
+    @discardableResult
+    func resolveCustomSync() throws -> [CIDR] {
+        let hosts = loadCustom()
+        if hosts.isEmpty {
+            try? FileManager.default.removeItem(at: customResolvedURL)
+            return []
+        }
+        let agg = resolveHosts(hosts, exclude: [], progress: nil)
+        try write(agg.map(\.description), to: customResolvedURL)
+        return agg
+    }
+
+    /// Full refresh: download (when needed) + resolve downloaded and custom domains.
+    @discardableResult
+    func updateSync(force: Bool, exclude: [CIDR] = [], progress: ((Int, Int) -> Void)? = nil) throws -> [CIDR] {
+        if force || !isFresh() || loadDomains().isEmpty {
+            _ = try downloadDomainsSync()
+        }
+        let agg = try resolveDomainsSync(exclude: exclude, progress: progress)
+        try resolveCustomSync()
+        return agg
+    }
+
+    func update(force: Bool, exclude: [CIDR] = [], progress: ((Int, Int) -> Void)? = nil) async throws -> [CIDR] {
+        try await Task.detached(priority: .utility) {
+            try self.updateSync(force: force, exclude: exclude, progress: progress)
+        }.value
+    }
+}
+
 // MARK: - Route engine
 
 final class RouteEngine {
     let dir: URL
     var appliedURL: URL
+    /// Records the interface name and its IPv4 address at the time the routes
+    /// were added (2 lines: interface, address). The kernel binds each route to
+    /// the interface address that was current when it was created, so if the
+    /// address later changes (DHCP lease change) the routes keep a stale source
+    /// address and every connection through them fails with "Can't assign
+    /// requested address". The routes must then be removed and re-added.
+    var appliedMetaURL: URL
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         dir = base.appendingPathComponent("IranBypass", isDirectory: true)
         appliedURL = dir.appendingPathComponent("applied-routes.txt")
+        appliedMetaURL = dir.appendingPathComponent("applied-meta.txt")
     }
 
     func hasAppliedRecord() -> Bool {
         FileManager.default.fileExists(atPath: appliedURL.path)
     }
 
-    /// Verify the routes we recorded are still in the routing table (they vanish on reboot).
+    /// The IPv4 address currently assigned to an interface, if any.
+    func interfaceIPv4(_ name: String) -> String? {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+        var ptr: UnsafeMutablePointer<ifaddrs>? = first
+        while let cur = ptr {
+            let ifa = cur.pointee
+            if let sa = ifa.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) {
+                if String(cString: ifa.ifa_name) == name {
+                    var addr = sa.pointee
+                    var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                    if getnameinfo(&addr, socklen_t(sa.pointee.sa_len),
+                                   &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
+                        return String(cString: host)
+                    }
+                }
+            }
+            ptr = ifa.ifa_next
+        }
+        return nil
+    }
+
+    private func writeAppliedMeta(iface: String) throws {
+        let addr = interfaceIPv4(iface) ?? ""
+        try "\(iface)\n\(addr)".write(to: appliedMetaURL, atomically: true, encoding: .utf8)
+    }
+
+    private func readAppliedMeta() -> (iface: String, addr: String)? {
+        guard let content = try? String(contentsOf: appliedMetaURL, encoding: .utf8) else { return nil }
+        let lines = content.split(separator: "\n").map(String.init)
+        guard let iface = lines.first, !iface.isEmpty else { return nil }
+        return (iface, lines.count >= 2 ? lines[1] : "")
+    }
+
+    /// Verify the routes we recorded are still in the routing table (they vanish
+    /// on reboot) and were created with the interface address still in use.
     func appliedRoutesValid() -> Bool {
         guard let content = try? String(contentsOf: appliedURL, encoding: .utf8) else { return false }
         let lines = content.split(separator: "\n").map(String.init)
@@ -332,18 +699,27 @@ final class RouteEngine {
         let gw = lines[0]
         let net = lines[1].split(separator: " ").first.map(String.init) ?? ""
         guard IPv4.parse(gw) != nil, !net.isEmpty, let current = routeGetGateway(net) else { return false }
-        return current == gw
+        guard current == gw else { return false }
+        if let m = readAppliedMeta(), !m.addr.isEmpty, interfaceIPv4(m.iface) != m.addr { return false }
+        return true
     }
 
     /// True when the bypass needs to be re-applied: the local gateway changed
-    /// (switched networks) or the routes were flushed (reboot, or a VPN client
-    /// that flushes the routing table when its tunnel comes up).
+    /// (switched networks), the interface address changed (DHCP lease renewal,
+    /// which leaves the routes with a stale source address), or the routes were
+    /// flushed (reboot, or a VPN client that flushes the routing table when its
+    /// tunnel comes up).
     func needsReapply() -> Bool {
         guard let content = try? String(contentsOf: appliedURL, encoding: .utf8) else { return false }
         let lines = content.split(separator: "\n").map(String.init)
         guard lines.count >= 2, IPv4.parse(lines[0]) != nil else { return false }
         let recordedGw = lines[0]
-        if let current = defaultGateway(), current.gw != recordedGw { return true }
+        let current = defaultGateway()
+        if let current, current.gw != recordedGw { return true }
+        if let m = readAppliedMeta(), !m.addr.isEmpty,
+           let current, current.iface == m.iface, interfaceIPv4(m.iface) != m.addr {
+            return true
+        }
         let net = lines[1].split(separator: " ").first.map(String.init) ?? ""
         guard !net.isEmpty else { return false }
         return routeGetGateway(net) != recordedGw
@@ -436,18 +812,40 @@ final class RouteEngine {
         throw BypassError.runtime("Helper failed: \(e.isEmpty ? "(no output)" : e)")
     }
 
-    func applySync(cidrs: [CIDR], gateway: String) throws -> String {
+    private func recordApplied(content: String, iface: String?) throws {
+        try content.write(to: appliedURL, atomically: true, encoding: .utf8)
+        if let iface, !iface.isEmpty {
+            try writeAppliedMeta(iface: iface)
+        } else {
+            try? FileManager.default.removeItem(at: appliedMetaURL)
+        }
+    }
+
+    func applySync(cidrs: [CIDR], gateway: String, iface: String? = nil) throws -> String {
         let routesFile = try writeRoutesFile(gateway: gateway, cidrs: cidrs)
+        let content = ([gateway] + cidrs.map { "\($0.networkString) \($0.netmaskString)" })
+            .joined(separator: "\n")
         if helperInstalled() {
             do {
-                return try runHelper("apply", file: routesFile)
+                // Drop routes that were applied before but are no longer part of
+                // the bypass (list shrank, custom domain removed, gateway changed).
+                let previous = (try? String(contentsOf: appliedURL, encoding: .utf8)) ?? ""
+                if !previous.isEmpty && previous != content {
+                    _ = try? runHelper("remove", file: appliedURL)
+                }
+                // Remove the new set before adding it: `route add` on an existing
+                // entry does not refresh it, so any route whose binding is stale
+                // (older gateway, or an interface address that changed) would
+                // otherwise keep pointing at the wrong source address.
+                _ = try? runHelper("remove", file: routesFile)
+                let out = try runHelper("apply", file: routesFile)
+                try recordApplied(content: content, iface: iface)
+                return out
             } catch BypassError.helperMissing { /* helper deleted or unauthorized — reinstall */ }
         }
         try installHelper()
         let out = try runHelper("apply", file: routesFile)
-        try ([gateway] + cidrs.map { "\($0.networkString) \($0.netmaskString)" })
-            .joined(separator: "\n")
-            .write(to: appliedURL, atomically: true, encoding: .utf8)
+        try recordApplied(content: content, iface: iface)
         return out
     }
 
@@ -458,7 +856,10 @@ final class RouteEngine {
         }
         let lines = content.split(separator: "\n").map(String.init)
         guard lines.count >= 2, IPv4.parse(lines[0]) != nil else { return "no routes recorded" }
-        defer { try? FileManager.default.removeItem(at: appliedURL) }
+        defer {
+            try? FileManager.default.removeItem(at: appliedURL)
+            try? FileManager.default.removeItem(at: appliedMetaURL)
+        }
         if helperInstalled() {
             do {
                 return try runHelper("remove", file: appliedURL)
@@ -559,8 +960,10 @@ fi
         """
     }
 
-    func apply(cidrs: [CIDR], gateway: String) async throws -> String {
-        try await Task.detached(priority: .userInitiated) { try self.applySync(cidrs: cidrs, gateway: gateway) }.value
+    func apply(cidrs: [CIDR], gateway: String, iface: String? = nil) async throws -> String {
+        try await Task.detached(priority: .userInitiated) {
+            try self.applySync(cidrs: cidrs, gateway: gateway, iface: iface)
+        }.value
     }
 
     func remove() async throws -> String {
@@ -596,11 +999,15 @@ final class BypassViewModel: ObservableObject {
     @Published var enabled = false
     @Published var status = "Ready"
     @Published var info: [String] = []
+    @Published var customDomains: [String] = []
+    @Published var newDomain = ""
 
     private let engine = RouteEngine()
     private let listStore = IPListStore()
+    private let domainStore = DomainListStore()
     private let pathMonitor = NWPathMonitor()
     private var recheckTask: Task<Void, Never>?
+    private var websiteTask: Task<Void, Never>?
 
     init() {
         if engine.hasAppliedRecord() {
@@ -646,18 +1053,20 @@ final class BypassViewModel: ObservableObject {
         }
     }
 
-    func reapplyIfNeeded() async {
+    func reapplyIfNeeded(force: Bool = false) async {
         guard enabled, !busy, engine.hasAppliedRecord() else { return }
         guard engine.helperInstalled() else {
             status = "Routes need re-applying — toggle off & on to reinstall the helper"
             return
         }
         let eng = engine
-        let needs = await Task.detached(priority: .utility) { eng.needsReapply() }.value
-        guard needs else { return }
-        let cidrs = listStore.loadCached()
+        if !force {
+            let needs = await Task.detached(priority: .utility) { eng.needsReapply() }.value
+            guard needs else { return }
+        }
+        let cidrs = aggregate(listStore.loadCached() + domainStore.loadResolved())
         guard !cidrs.isEmpty else {
-            status = "⚠️ Routes need re-applying but the IP list cache is empty"
+            status = "⚠️ Routes need re-applying but the list cache is empty"
             return
         }
         busy = true
@@ -665,7 +1074,7 @@ final class BypassViewModel: ObservableObject {
         do {
             guard let g = engine.defaultGateway() else { throw BypassError.noGateway }
             status = "Network changed — re-applying \(cidrs.count) routes via \(g.gw)…"
-            let out = try await engine.apply(cidrs: cidrs, gateway: g.gw)
+            let out = try await engine.apply(cidrs: cidrs, gateway: g.gw, iface: g.iface)
             status = "Bypass ON — \(out)"
         } catch {
             status = "⚠️ Re-apply failed: \(error.localizedDescription)"
@@ -676,7 +1085,8 @@ final class BypassViewModel: ObservableObject {
     func refreshInfo() {
         var lines: [String] = []
         if let g = engine.defaultGateway() {
-            lines.append("Local gateway: \(g.gw)  (\(g.iface))")
+            let addr = engine.interfaceIPv4(g.iface).map { "  \($0)" } ?? ""
+            lines.append("Local gateway: \(g.gw)  (\(g.iface)\(addr))")
         } else {
             lines.append("Local gateway: not detected")
         }
@@ -686,9 +1096,16 @@ final class BypassViewModel: ObservableObject {
             f.dateFormat = "yyyy-MM-dd HH:mm"
             lines.append("List updated: \(f.string(from: d))")
         }
+        lines.append("Iranian websites cached: \(domainStore.loadDomains().count) domains → \(domainStore.loadResolved().count) IPv4")
+        if let d = domainStore.cachedDate() {
+            let f = DateFormatter()
+            f.dateFormat = "yyyy-MM-dd HH:mm"
+            lines.append("Websites updated: \(f.string(from: d))")
+        }
         lines.append("ExpressVPN: \(engine.expressVPNRunning() ? "running" : "not detected")")
         lines.append("Password-free helper: \(engine.helperInstalled() ? "installed" : "not installed yet")")
         info = lines
+        customDomains = domainStore.loadCustom()
     }
 
     func toggle() {
@@ -706,26 +1123,33 @@ final class BypassViewModel: ObservableObject {
     }
 
     private func enable() async throws {
-        var cidrs = listStore.loadCached()
-        if cidrs.isEmpty || !listStore.isFresh() {
+        var ipCidrs = listStore.loadCached()
+        if ipCidrs.isEmpty || !listStore.isFresh() {
             status = "Downloading IP list (Iran-v2ray-rules)…"
             do {
-                cidrs = try await listStore.update(force: false)
+                ipCidrs = try await listStore.update(force: false)
             } catch {
-                if cidrs.isEmpty { throw error }
+                if ipCidrs.isEmpty { throw error }
                 status = "Using cached list (download failed)"
             }
         }
-        guard !cidrs.isEmpty else { throw BypassError.listEmpty }
+        guard !ipCidrs.isEmpty else { throw BypassError.listEmpty }
+
+        let webCidrs = domainStore.loadResolved()
+        let cidrs = aggregate(ipCidrs + webCidrs)
         status = "Detecting local gateway…"
         guard let g = engine.defaultGateway() else { throw BypassError.noGateway }
         let needsSetup = !engine.helperInstalled()
+        let webNote = webCidrs.isEmpty ? "" : " + \(webCidrs.count) website IPs"
         status = needsSetup
-            ? "First-time setup + adding \(cidrs.count) routes via \(g.gw)… (password asked once)"
-            : "Adding \(cidrs.count) routes via \(g.gw)…"
-        let out = try await engine.apply(cidrs: cidrs, gateway: g.gw)
+            ? "First-time setup + adding \(cidrs.count) routes\(webNote) via \(g.gw)… (password asked once)"
+            : "Adding \(cidrs.count) routes\(webNote) via \(g.gw)…"
+        let out = try await engine.apply(cidrs: cidrs, gateway: g.gw, iface: g.iface)
         enabled = true
         status = "Bypass ON — \(out)"
+        if webCidrs.isEmpty || !domainStore.isFresh() {
+            refreshWebsites(force: false)
+        }
     }
 
     private func disable() async throws {
@@ -733,6 +1157,83 @@ final class BypassViewModel: ObservableObject {
         let out = try await engine.remove()
         enabled = false
         status = "Bypass OFF — \(out)"
+    }
+
+    // MARK: website list
+
+    /// Download (when stale) and resolve the Iranian website list in the
+    /// background, then re-apply routes so the new IPs take effect.
+    func refreshWebsites(force: Bool) {
+        guard websiteTask == nil else { return }
+        let store = domainStore
+        websiteTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let exclude = self.listStore.loadCached()
+                let agg = try await store.update(force: force, exclude: exclude) { done, total in
+                    DispatchQueue.main.async {
+                        guard self.websiteTask != nil else { return }
+                        self.status = "Resolving websites… \(done)/\(total)"
+                    }
+                }
+                self.status = "Website list ready — \(agg.count) IPs bypassed"
+                self.websiteTask = nil
+                self.refreshInfo()
+                if self.enabled { await self.reapplyIfNeeded(force: true) }
+            } catch {
+                self.status = "⚠️ Website list: \(error.localizedDescription)"
+                self.websiteTask = nil
+                self.refreshInfo()
+            }
+        }
+    }
+
+    func updateWebsites() {
+        guard !busy else { return }
+        guard websiteTask == nil else {
+            status = "Website list is already updating…"
+            return
+        }
+        refreshWebsites(force: true)
+    }
+
+    func addCustomDomain() {
+        let raw = newDomain.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return }
+        do {
+            let d = try domainStore.addCustom(raw)
+            newDomain = ""
+            customDomains = domainStore.loadCustom()
+            status = "Added \(d) — resolving…"
+            resolveCustomDomains()
+        } catch {
+            status = "⚠️ \(error.localizedDescription)"
+        }
+    }
+
+    func removeCustomDomain(_ d: String) {
+        do {
+            try domainStore.removeCustom(d)
+            customDomains = domainStore.loadCustom()
+            status = "Removed \(d)"
+            resolveCustomDomains()
+        } catch {
+            status = "⚠️ \(error.localizedDescription)"
+        }
+    }
+
+    private func resolveCustomDomains() {
+        let store = domainStore
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await Task.detached(priority: .utility) { try store.resolveCustomSync() }.value
+                self.refreshInfo()
+                if self.enabled { await self.reapplyIfNeeded(force: true) }
+            } catch {
+                self.status = "⚠️ \(error.localizedDescription)"
+            }
+        }
     }
 
     func updateList() {
@@ -790,9 +1291,79 @@ struct ContentView: View {
 
             Divider()
 
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Bypass extra websites").font(.caption).bold()
+                    Spacer()
+                    if !vm.customDomains.isEmpty {
+                        Text("\(vm.customDomains.count) added")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text("Domains are resolved to IPs and routed outside the VPN (same switch).")
+                    .font(.caption2).foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    TextField("example.com", text: $vm.newDomain)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                        .onSubmit { vm.addCustomDomain() }
+                    Button("Add") { vm.addCustomDomain() }
+                        .controlSize(.small)
+                        .disabled(vm.busy || vm.newDomain.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                if vm.customDomains.isEmpty {
+                    Text("No custom domains yet — add one above.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                } else {
+                    // A bare ScrollView has no intrinsic height, so inside the
+                    // MenuBarExtra window (which sizes to its content) it collapses
+                    // to zero and the rows never appear. Give it an explicit height
+                    // that grows with the number of domains, capped so it scrolls.
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(vm.customDomains, id: \.self) { d in
+                                HStack(spacing: 6) {
+                                    Image(systemName: "globe")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    Text(d)
+                                        .font(.caption2)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Spacer(minLength: 4)
+                                    Button {
+                                        vm.removeCustomDomain(d)
+                                    } label: {
+                                        Image(systemName: "trash")
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .controlSize(.mini)
+                                    .help("Remove \(d)")
+                                }
+                                .frame(height: 18)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    .frame(height: min(CGFloat(vm.customDomains.count) * 20 + 4, 160))
+                }
+            }
+
+            Divider()
+
             HStack {
                 Button("Update IP list") { vm.updateList() }
                     .disabled(vm.busy)
+                Button("Update websites") { vm.updateWebsites() }
+                    .disabled(vm.busy)
+                Spacer()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            HStack {
                 Button("GitHub repo") { NSWorkspace.shared.open(IPListStore.repoPageURL) }
                 Spacer()
                 Button("Quit") { NSApp.terminate(nil) }
@@ -801,7 +1372,7 @@ struct ContentView: View {
             .controlSize(.small)
         }
         .padding(14)
-        .frame(width: 340)
+        .frame(width: 360)
     }
 }
 
@@ -865,6 +1436,139 @@ if args.contains("--categories") {
         exit(1)
     }
     exit(0)
+}
+
+if args.contains("--site-categories") {
+    do {
+        let data = try downloadSync(DomainListStore.geositeURL)
+        let all = try Proto.parseGeoSiteList(data)
+        for k in all.keys.sorted() { print("\(k): \(all[k]!.count) domains") }
+    } catch {
+        print("error: \(error.localizedDescription)")
+        exit(1)
+    }
+    exit(0)
+}
+if args.contains("--update-websites") {
+    do {
+        let store = DomainListStore()
+        let exclude = IPListStore().loadCached()
+        let t0 = Date()
+        let n = try store.updateSync(force: true, exclude: exclude) { done, total in
+            if done % 1000 == 0 { FileHandle.standardError.write("resolved \(done)/\(total)\n".data(using: .utf8)!) }
+        }
+        let secs = Int(Date().timeIntervalSince(t0))
+        print("website IPv4 routes: \(n.count) (after excluding \(exclude.count) Iranian ranges) in \(secs)s")
+    } catch {
+        print("error: \(error.localizedDescription)")
+        exit(1)
+    }
+    exit(0)
+}
+if let i = args.firstIndex(of: "--dump-domains") {
+    do {
+        let all = try Proto.parseGeoSiteList(try downloadSync(DomainListStore.geositeURL))
+        let cat = (i + 1 < args.count && !args[i + 1].hasPrefix("-")) ? args[i + 1] : "category-ir"
+        let list = all[cat] ?? all[cat.uppercased()] ?? []
+        print("\(cat): \(list.count) domains")
+        for d in list.prefix(30) { print("  \(d)") }
+    } catch {
+        print("error: \(error.localizedDescription)")
+        exit(1)
+    }
+    exit(0)
+}
+if let i = args.firstIndex(of: "--resolve"), i + 1 < args.count {
+    let host = args[i + 1]
+    let ips = DNS.resolveIPv4(host)
+    print(ips.isEmpty ? "no IPv4 found" : ips.map { IPv4.string($0) }.joined(separator: "\n"))
+    exit(0)
+}
+if args.contains("--custom-domains") {
+    let store = DomainListStore()
+    let list = store.loadCustom()
+    if list.isEmpty {
+        print("no custom domains")
+    } else {
+        print("\(list.count) custom domain(s):")
+        for d in list { print("  \(d)") }
+    }
+    exit(0)
+}
+if let i = args.firstIndex(of: "--remove-domain"), i + 1 < args.count {
+    let store = DomainListStore()
+    let raw = args[i + 1]
+    guard let d = DomainListStore.normalizeDomain(raw) else {
+        print("error: “\(raw)” doesn’t look like a domain"); exit(1)
+    }
+    do {
+        try store.removeCustom(d)
+        print("removed \(d)")
+    } catch {
+        print("error: \(error.localizedDescription)"); exit(1)
+    }
+    exit(0)
+}
+if args.contains("--status") {
+    let e = RouteEngine()
+    print("applied record: \(e.hasAppliedRecord())")
+    print("routes valid:   \(e.appliedRoutesValid())")
+    print("needs reapply:  \(e.needsReapply())")
+    if let m = (try? String(contentsOf: e.appliedMetaURL, encoding: .utf8))?.split(separator: "\n").map(String.init) {
+        print("meta:           \(m.joined(separator: " / "))")
+    } else {
+        print("meta:           (none)")
+    }
+    if let g = e.defaultGateway() {
+        print("gateway:        \(g.gw) (\(g.iface)) addr=\(e.interfaceIPv4(g.iface) ?? "-")")
+    }
+    exit(0)
+}
+if args.contains("--apply") || args.contains("--remove") {
+    let e = RouteEngine()
+    do {
+        if args.contains("--remove") {
+            let out = try e.removeSync()
+            print("remove: \(out)")
+        } else {
+            let cidrs = aggregate(IPListStore().loadCached() + DomainListStore().loadResolved())
+            guard let g = e.defaultGateway() else { print("error: no gateway"); exit(1) }
+            print("applying \(cidrs.count) routes via \(g.gw) (\(g.iface))…")
+            let out = try e.applySync(cidrs: cidrs, gateway: g.gw, iface: g.iface)
+            print("apply: \(out)")
+        }
+    } catch {
+        print("error: \(error.localizedDescription)")
+        exit(1)
+    }
+    exit(0)
+}
+if args.contains("--instances") {
+    let bid = Bundle.main.bundleIdentifier ?? "local.iranbypass"
+    let apps = NSRunningApplication.runningApplications(withBundleIdentifier: bid)
+    print("\(apps.count) instance(s) of \(bid):")
+    for a in apps {
+        print("  pid=\(a.processIdentifier) started=\(a.launchDate.map { "\($0)" } ?? "-")")
+    }
+    exit(0)
+}
+
+// Single-instance guard: launching a second copy (e.g. from another path) would
+// add a second menu bar icon, each with its own on/off state. If another live
+// instance of this bundle exists, exit quietly (after briefly waiting in case a
+// previous instance is still shutting down).
+if let bid = Bundle.main.bundleIdentifier, !args.contains("--allow-multi") {
+    let me = NSRunningApplication.current
+    func liveOthers() -> [NSRunningApplication] {
+        NSRunningApplication.runningApplications(withBundleIdentifier: bid)
+            .filter { $0.processIdentifier != me.processIdentifier && !$0.isTerminated }
+    }
+    var waited = 0
+    while !liveOthers().isEmpty && waited < 2000 {
+        usleep(200_000)
+        waited += 200
+    }
+    if !liveOthers().isEmpty { exit(0) }
 }
 
 IranBypassApp.main()
